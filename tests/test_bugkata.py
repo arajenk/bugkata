@@ -158,5 +158,55 @@ class GoHarnessTest(TempDirTest):
         self.assertLess(time.monotonic() - start, 40)
 
 
+@unittest.skipUnless(HAS_PYTEST, "pytest not installed")
+class PythonHarnessTest(TempDirTest):
+    def setUp(self):
+        import os
+
+        old = os.environ.get("BUGKATA_PYTHON")
+        os.environ["BUGKATA_PYTHON"] = sys.executable
+        self.addCleanup(
+            lambda: os.environ.pop("BUGKATA_PYTHON", None) if old is None
+            else os.environ.__setitem__("BUGKATA_PYTHON", old)
+        )
+
+    def test_python_make_fixed_moves_package(self):
+        out = bk.make_fixed("python", {"challenge/__init__.py": "x = 1\n", "challenge/a.py": "y\n"})
+        self.assertEqual(out, {"fixed/__init__.py": "x = 1\n", "fixed/a.py": "y\n"})
+
+    def test_python_run_challenge_and_fixed(self):
+        gym = self.make_gym()
+        work = stage(self, gym, "python-chunk")
+        r = bk.run_tests(gym, "python", work, "challenge")
+        self.assertEqual(r["status"], "ok", r["output"])
+        self.assertEqual(
+            r["tests"],
+            {
+                "test_chunk_even_split": "pass",
+                "test_chunk_empty": "pass",
+                "test_hidden_chunk_uneven": "fail",
+                "test_hidden_chunk_keeps_every_item": "fail",
+            },
+        )
+        r = bk.run_tests(gym, "python", work, "fixed")
+        self.assertEqual(set(r["tests"].values()), {"pass"})
+        self.assertEqual(len(r["tests"]), 4)
+
+    def test_python_collection_error(self):
+        gym = self.make_gym()
+        work = stage(self, gym, "python-chunk")
+        (work / "fixed" / "chunking.py").write_text("def chunk(:\n")
+        r = bk.run_tests(gym, "python", work, "fixed")
+        self.assertEqual(r["status"], "error")
+        self.assertTrue(r["output"])
+
+    def test_python_executable_missing(self):
+        import os
+
+        os.environ.pop("BUGKATA_PYTHON")
+        with self.assertRaises(bk.BugkataError):
+            bk.python_executable(self.make_gym())
+
+
 if __name__ == "__main__":
     unittest.main()

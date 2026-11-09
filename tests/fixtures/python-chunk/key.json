@@ -1,0 +1,16 @@
+{
+  "lang": "python",
+  "slug": "chunk",
+  "mode": "audit",
+  "tier": "medium",
+  "bugs": [
+    {
+      "id": "b1",
+      "category": "edge-cases",
+      "location": "challenge/chunking.py:chunk",
+      "what": "drops the last chunk when the list doesn't divide evenly",
+      "why": "the loop runs len(items) // size times, which rounds the partial chunk away",
+      "tests": ["test_hidden_chunk_uneven", "test_hidden_chunk_keeps_every_item"]
+    }
+  ]
+}

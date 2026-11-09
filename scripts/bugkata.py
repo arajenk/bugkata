@@ -20,6 +20,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -87,6 +89,8 @@ def is_code_file(lang: str, relpath: str) -> bool:
             and relpath.endswith(".go")
             and not relpath.endswith("_test.go")
         )
+    if lang == "python":
+        return relpath.startswith("challenge/")
     return False
 
 
@@ -99,6 +103,8 @@ def make_fixed(lang: str, code: dict[str, str]) -> dict[str, str]:
             if first.strip() != GO_TAG_CHALLENGE:
                 raise BugkataError(f"{rel}: first line must be `{GO_TAG_CHALLENGE}`")
             out["fixed" + rel[len("challenge"):]] = GO_TAG_FIXED + "\n" + rest
+        elif lang == "python":
+            out["fixed/" + rel[len("challenge/"):]] = text
         else:
             raise BugkataError(f"unknown language {lang}")
     return out
@@ -171,6 +177,80 @@ def _run_go(workdir: Path, target: str, race: bool, timeout: int) -> dict:
     return {"status": "ok", "tests": tests, "output": ""}
 
 
+CONFTEST = '''\
+"""Written by bugkata. Picks which package the tests import as `target`.
+
+BUGKATA_TARGET=challenge (default) tests challenge/, BUGKATA_TARGET=fixed tests fixed/.
+"""
+import importlib
+import os
+import sys
+
+_name = os.environ.get("BUGKATA_TARGET", "challenge")
+if _name not in ("challenge", "fixed"):
+    raise RuntimeError("BUGKATA_TARGET must be 'challenge' or 'fixed', not %r" % _name)
+sys.modules["target"] = importlib.import_module(_name)
+'''
+
+
+def write_python_harness(workdir: Path) -> None:
+    (workdir / "conftest.py").write_text(CONFTEST)
+    # An inifile here stops pytest from searching parent dirs for config.
+    (workdir / "pytest.ini").write_text("[pytest]\n")
+
+
+def python_executable(gym: Path) -> str:
+    override = os.environ.get("BUGKATA_PYTHON")
+    if override:
+        return override
+    venv = gym / "python" / ".venv" / "bin" / "python"
+    if not venv.exists():
+        raise BugkataError("python venv missing (run /bugkata:start python)")
+    return str(venv)
+
+
+_RESULT_RANK = {"pass": 0, "skip": 1, "fail": 2}
+
+
+def _run_python(gym: Path, workdir: Path, target: str, timeout: int) -> dict:
+    report_dir = Path(tempfile.mkdtemp(prefix="bugkata-"))
+    try:
+        junit = report_dir / "junit.xml"
+        cmd = [
+            python_executable(gym), "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            f"--junitxml={junit}",
+        ]
+        env = {**os.environ, "BUGKATA_TARGET": target, "PYTHONDONTWRITEBYTECODE": "1"}
+        try:
+            proc = subprocess.run(
+                cmd, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout or ""
+            if isinstance(out, bytes):
+                out = out.decode(errors="replace")
+            return {"status": "timeout", "tests": {}, "output": _tail(out)}
+        output = proc.stdout + "\n" + proc.stderr
+        if proc.returncode not in (0, 1, 5):
+            return {"status": "error", "tests": {}, "output": _tail(output)}
+
+        tests: dict[str, str] = {}
+        if junit.is_file():
+            for case in ET.parse(junit).iter("testcase"):
+                name = case.get("name", "").split("[", 1)[0]
+                if case.find("failure") is not None or case.find("error") is not None:
+                    result = "fail"
+                elif case.find("skipped") is not None:
+                    result = "skip"
+                else:
+                    result = "pass"
+                if _RESULT_RANK[result] >= _RESULT_RANK.get(tests.get(name, "pass"), 0):
+                    tests[name] = result
+        return {"status": "ok", "tests": tests, "output": ""}
+    finally:
+        shutil.rmtree(report_dir, ignore_errors=True)
+
+
 def run_tests(
     gym: Path, lang: str, workdir: Path, target: str, *, race: bool = False, timeout: int = 120
 ) -> dict:
@@ -183,6 +263,8 @@ def run_tests(
         raise BugkataError(f"unknown target {target}")
     if lang == "go":
         return _run_go(workdir, target, race, timeout)
+    if lang == "python":
+        return _run_python(gym, workdir, target, timeout)
     raise BugkataError(f"unknown language {lang}")
 
 
