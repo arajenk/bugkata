@@ -79,7 +79,9 @@ Global `~/.bugkata/`:
 
 Gym `.bugkata/`:
 - `state.json`: current focus, current challenge, per-language counters
-- `cache/`: answer keys, reference fixes, hidden tests, prefetched challenge. Hash-named and base64-encoded; light obfuscation only.
+- `cache/`: answer keys, reference fixes, hidden tests, prefetched challenge. One file per challenge, named by a hash of its path, base64-encoded JSON; light obfuscation only.
+
+The gym root is the folder holding `.bugkata/state.json`. A bare `.bugkata/` folder isn't enough, since `~/.bugkata/` would make the home dir look like a gym.
 
 Spoiler protection is layered, and aims at accidental spoilers, not determined cheaters (cheating only cheats yourself):
 1. Generation runs in a separate context, so the player's session never sees the key.
@@ -160,12 +162,12 @@ Generation runs in a separate subagent (spoiler layer 1, see State). It returns 
 
 1. Pick mode, target D, and bug categories weighted toward weak spots, or serve a due retry.
 2. Write correct, idiomatic code and `spec.md`, then inject bugs and decoys. No tells: no hint comments, odd names, or style shifts.
-3. Script verification (no tokens): each bug has its own hidden tests, which must fail on challenge and pass on the reference fix. Visible tests must behave as the tier requires. Concurrency bugs are forced through seams, with `-race` and repeated runs as a backstop.
+3. Script verification (no tokens): the generator writes a staging bundle (`key.json`, `visible/`, `reference/`, `hidden/`) in a temp dir outside the gym, and `bugkata.py verify` runs it. Each bug has its own hidden tests, which must fail on challenge and pass on the reference fix. Visible tests must behave as the tier requires. Concurrency bugs are forced through seams, with `-race` and repeated runs as a backstop. The harness refs define the bundle and the naming rules.
 4. Reviewer subagent (`agents/challenge-reviewer.md`): a teacher checking the exam before students see it. One fresh subagent, two passes in the same context:
    - Blind pass, without the key: looks for tells and accidental bugs. The share of real bugs it finds feeds the difficulty estimate.
    - Keyed pass, with the key given after the blind report: checks fairness, spec clarity, decoy quality, and difficulty against target D, and notes why it missed what it missed.
 5. Patch anything flagged instead of regenerating, rerun script verification, and re-check only the flagged items. After 2 fix rounds, discard and start over.
-6. Write files. Output nothing that explains, runs, or hints at the bugs.
+6. Write files: `bugkata.py encode` installs the bundle as the next numbered folder, makes the `fixed*` copies, and moves the key, reference, and hidden tests into the cache. Output nothing that explains, runs, or hints at the bugs.
 
 ## Token budget
 - Scripts handle verify, run, score, rate, and encode.
@@ -226,7 +228,7 @@ One short Easy Audit in the user's first language. Hints are free and offered up
 ## Build plan
 Small diffs, each reviewed.
 1. ✅ Done. Plugin skeleton with `start`, `help`, and a `hint` stub. Confirm install, that `start` triggers from plain English while `hint` doesn't, `/bugkata:<skill>` naming, args passing, shared-file references, that a plugin `PreToolUse` hook can block reads of a folder, and whether a background subagent can finish work after the turn ends (for prefetch).
-2. Harness refs (Go, Python, including the Go build-tag flip) and `bugkata.py` encode/decode/verify/run.
+2. ✅ Done. Harness refs (Go, Python, including the Go build-tag flip) and `bugkata.py` encode/decode/verify/run.
 3. `references/core.md`, `start` (gym setup, launch, Audit generation), and `submit`.
 4. `references/bug-catalog.md`.
 5. Reviewer subagent: blind and keyed passes, patch loop.
