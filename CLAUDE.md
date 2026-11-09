@@ -47,7 +47,7 @@ agents/
 README.md
 LICENSE
 ```
-Every skill sets `disable-model-invocation: true` so commands only run when typed. An auto-fired hint or reveal would spoil a challenge. Skills stay thin and point to `references/` and `scripts/`; how a skill references files outside its own folder (e.g. `${CLAUDE_PLUGIN_ROOT}`) and how args are passed is verified in build step 1.
+`hint`, `skip`, `submit`, and `reset` set `disable-model-invocation: true` so they only run when typed; an auto-fired hint or reveal would spoil a challenge or cost points. `start`, `help`, `stats`, and `config` can trigger from plain English ("give me a go challenge", "how am I doing?"). Skills stay thin and point to `references/` and `scripts/`; how a skill references files outside its own folder (e.g. `${CLAUDE_PLUGIN_ROOT}`) and how args are passed is verified in build step 1.
 
 ## The gym
 Users practice in a dedicated gym repo, never a real project. One gym, one folder per language:
@@ -128,6 +128,8 @@ Elo, tracked per mode × language:
 - A new mode × language starts from the player's other ratings in that language, or the tutorial result if there are none.
 
 ## Generation pipeline
+Generation runs in a separate subagent so the player's session never sees the answer key. The subagent returns only the challenge path and a one-line status, never code, bugs, or test contents. As a backup, `references/core.md` forbids discussing a challenge's bugs outside `hint`, `skip`, and `submit`.
+
 1. Pick mode, target D, and bug categories weighted toward weak spots, or serve a due retry.
 2. Write correct, idiomatic code and `spec.md`, then inject bugs and decoys. No tells: no hint comments, odd names, or style shifts.
 3. Script verification (no tokens): each bug has its own hidden tests, which must fail on challenge and pass on the reference fix. Visible tests must behave as the tier requires. Concurrency bugs are forced through seams, with `-race` and repeated runs as a backstop.
@@ -195,7 +197,7 @@ One short Easy Audit in the user's first language. Hints are free and offered up
 
 ## Build plan
 Small diffs, each reviewed.
-1. Plugin skeleton with `start` and `help` only. Confirm install, `/bugkata:<skill>` naming, args passing, shared-file references, and whether a background subagent can finish work after the turn ends (for prefetch).
+1. Plugin skeleton with `start`, `help`, and a `hint` stub. Confirm install, that `start` triggers from plain English while `hint` doesn't, `/bugkata:<skill>` naming, args passing, shared-file references, and whether a background subagent can finish work after the turn ends (for prefetch).
 2. Harness refs (Go, Python, including the Go build-tag flip) and `bugkata.py` encode/decode/verify/run.
 3. `references/core.md`, `start` (gym setup, launch, Audit generation), and `submit`.
 4. `references/bug-catalog.md`.
