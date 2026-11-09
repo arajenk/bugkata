@@ -78,7 +78,7 @@ Gym `.bugkata/`:
 
 Spoiler protection is layered, and aims at accidental spoilers, not determined cheaters (cheating only cheats yourself):
 1. Generation runs in a separate context, so the player's session never sees the key.
-2. A `PreToolUse` hook blocks Read, Grep, and Bash access to `.bugkata/cache/` except through `bugkata.py`. Claude Code enforces this, so it doesn't depend on Claude following instructions.
+2. A `PreToolUse` hook (`scripts/guard.py`) blocks any Read, Grep, Glob, or Bash call that mentions `.bugkata`, except a plain call to `bugkata.py`. Claude Code enforces this, so it doesn't depend on Claude following instructions. `bugkata.py` finds the gym and `~/.bugkata/` itself, so skills never put `.bugkata` paths in commands. The guard fails open (malformed input is allowed), since it only targets accidental spoilers.
 3. `bugkata.py` never prints answers outside `hint`, `skip`, and `submit` output.
 4. A rule in `references/core.md` as a backup.
 
