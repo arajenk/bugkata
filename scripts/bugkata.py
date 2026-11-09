@@ -503,11 +503,114 @@ def verify(gym: Path, staging: Path, repeat: int = 3, timeout: int = 120) -> lis
     return problems
 
 
+# ------------------------------------------------------- encode, decode, run
+
+NOTES_TEMPLATE = """\
+# Notes
+
+One block per bug you find. Copy the block for each one.
+
+## Bug 1
+- Location: (file and line, or function)
+- Claim: (what goes wrong)
+- Why: (the mechanism that makes it go wrong)
+- Proof: (name of your test that fails on challenge and passes on fixed)
+"""
+
+CHALLENGE_PATH = re.compile(r"^(go|python)/\d{3}-[a-z0-9]+(-[a-z0-9]+)*$")
+NUMBERED = re.compile(r"^(\d{3})-")
+SKIP_DIRS = ("__pycache__", ".pytest_cache")
+
+
+def next_challenge_path(gym: Path, lang: str, slug: str) -> str:
+    lang_dir = gym / lang
+    numbers = [
+        int(m.group(1))
+        for p in (lang_dir.iterdir() if lang_dir.is_dir() else [])
+        if p.is_dir() and (m := NUMBERED.match(p.name))
+    ]
+    return f"{lang}/{max(numbers, default=0) + 1:03d}-{slug}"
+
+
+def _check_challenge(gym: Path, challenge: str) -> tuple[str, Path]:
+    challenge = challenge.strip().strip("/")
+    if not CHALLENGE_PATH.match(challenge):
+        raise BugkataError(f"{challenge!r} is not a challenge path like go/001-name")
+    folder = gym / challenge
+    if not folder.is_dir():
+        raise BugkataError(f"no challenge folder {challenge}")
+    return challenge, folder
+
+
+def encode(gym: Path, staging: Path) -> str:
+    """Install a staging bundle as the next challenge. Returns its gym path."""
+    staged = read_staging(staging)
+    problems = static_problems(staged)
+    if problems:
+        raise BugkataError("staging bundle has problems:\n" + "\n".join(problems))
+    key, visible = staged["key"], staged["visible"]
+    lang = key["lang"]
+    challenge = next_challenge_path(gym, lang, key["slug"])
+    folder = gym / challenge
+    if folder.exists():
+        raise BugkataError(f"{challenge} already exists")
+
+    files = dict(visible)
+    files.update(make_fixed(lang, {r: t for r, t in visible.items() if is_code_file(lang, r)}))
+    files.setdefault("notes.md", NOTES_TEMPLATE)
+    if lang == "python":
+        files["conftest.py"] = CONFTEST
+    try:
+        for rel, text in files.items():
+            dest = folder / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text)
+        save_bundle(gym, challenge, {
+            "version": 1,
+            "challenge": challenge,
+            "key": key,
+            "reference": staged["reference"],
+            "hidden": staged["hidden"],
+        })
+    except BaseException:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    shutil.rmtree(staging, ignore_errors=True)
+    return challenge
+
+
+def decode(gym: Path, challenge: str, out: Path) -> None:
+    out = out.resolve()
+    if out == gym.resolve() or gym.resolve() in out.parents:
+        raise BugkataError("--out must be outside the gym, so answers never land next to the challenge")
+    challenge = challenge.strip().strip("/")
+    bundle = load_bundle(gym, challenge)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "key.json").write_text(json.dumps(bundle["key"], indent=2) + "\n")
+    for part in ("reference", "hidden"):
+        for rel, text in bundle[part].items():
+            dest = out / part / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text)
+
+
+def run_challenge(gym: Path, challenge: str, target: str, timeout: int = 120) -> dict:
+    """Run an installed challenge's visible and player tests (never hidden ones)."""
+    challenge, folder = _check_challenge(gym, challenge)
+    lang = challenge.split("/", 1)[0]
+    workdir = stage_workdir(gym, lang, {})
+    try:
+        shutil.copytree(folder, workdir, dirs_exist_ok=True, ignore=shutil.ignore_patterns(*SKIP_DIRS))
+        if lang == "go":
+            write_go_mod(gym, workdir)
+        else:
+            write_python_harness(workdir)
+        return run_tests(gym, lang, workdir, target, timeout=timeout)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 # ------------------------------------------------------------------------ CLI
-
-def _not_built(args) -> int:
-    raise BugkataError(f"{args.command} is not built yet")
-
 
 def _print(obj: dict) -> None:
     print(json.dumps(obj, indent=2))
@@ -521,9 +624,27 @@ def _cmd_verify(args) -> int:
     return 0 if not problems else 1
 
 
+def _cmd_encode(args) -> int:
+    _print({"challenge": encode(find_gym(Path.cwd()), Path(args.staging))})
+    return 0
+
+
+def _cmd_decode(args) -> int:
+    decode(find_gym(Path.cwd()), args.challenge, Path(args.out))
+    _print({"out": str(Path(args.out).resolve())})
+    return 0
+
+
 def _cmd_run(args) -> int:
-    find_gym(Path.cwd())
-    return _not_built(args)
+    gym = find_gym(Path.cwd())
+    challenge = args.challenge.strip().strip("/")
+    result = run_challenge(gym, challenge, args.target, timeout=args.timeout)
+    out = {"challenge": challenge, "target": args.target, "status": result["status"],
+           "tests": result["tests"]}
+    if result["status"] != "ok":
+        out["output"] = result["output"]
+    _print(out)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -538,15 +659,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     e = sub.add_parser("encode")
     e.add_argument("staging")
-    e.set_defaults(func=_not_built)
+    e.set_defaults(func=_cmd_encode)
 
     d = sub.add_parser("decode")
     d.add_argument("challenge")
     d.add_argument("--out", required=True)
-    d.set_defaults(func=_not_built)
+    d.set_defaults(func=_cmd_decode)
 
     r = sub.add_parser("run")
     r.add_argument("challenge")
+    r.add_argument("--target", choices=("challenge", "fixed"), default="fixed")
+    r.add_argument("--timeout", type=int, default=120)
     r.set_defaults(func=_cmd_run)
     return p
 

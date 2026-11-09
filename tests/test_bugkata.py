@@ -296,5 +296,123 @@ class VerifyRunTest(TempDirTest):
         self.assertFalse(json.loads(r.stdout)["ok"])
 
 
+class EncodeTest(TempDirTest):
+    def test_encode_go_installs_challenge(self):
+        gym = self.make_gym()
+        (gym / "go" / "001-old").mkdir(parents=True)
+        (gym / "go" / "notes").mkdir()
+        staging = copy_fixture(self, "go-truncate")
+        path = bk.encode(gym, staging)
+        self.assertEqual(path, "go/002-truncate")
+        folder = gym / path
+        self.assertEqual(
+            sorted(p.name for p in folder.iterdir()),
+            ["challenge.go", "fixed.go", "notes.md", "spec.md", "truncate_test.go"],
+        )
+        self.assertTrue((folder / "fixed.go").read_text().startswith("//go:build fixed\n"))
+        self.assertIn("len(s) <= n", (folder / "fixed.go").read_text())  # a copy of challenge, not reference
+        self.assertEqual((folder / "notes.md").read_text(), bk.NOTES_TEMPLATE)
+        self.assertFalse(staging.exists())
+        bundle = bk.load_bundle(gym, path)
+        self.assertEqual(bundle["key"]["slug"], "truncate")
+        self.assertIn("hidden_truncate_test.go", bundle["hidden"])
+        self.assertIn("[]rune(s)", bundle["reference"]["challenge.go"])
+
+    def test_encode_python_installs_challenge(self):
+        gym = self.make_gym()
+        path = bk.encode(gym, copy_fixture(self, "python-chunk"))
+        self.assertEqual(path, "python/001-chunk")
+        folder = gym / path
+        for rel in ["challenge/chunking.py", "fixed/chunking.py", "fixed/__init__.py",
+                    "conftest.py", "test_chunk.py", "spec.md", "notes.md"]:
+            self.assertTrue((folder / rel).is_file(), rel)
+        self.assertFalse(any(p.name.startswith("test_hidden") for p in folder.rglob("*")))
+
+    def test_encode_refuses_existing_folder(self):
+        gym = self.make_gym()
+        bk.encode(gym, copy_fixture(self, "go-truncate"))
+        with mock.patch.object(bk, "next_challenge_path", return_value="go/001-truncate"):
+            with self.assertRaises(bk.BugkataError):
+                bk.encode(gym, copy_fixture(self, "go-truncate"))
+
+    def test_encode_rejects_static_problems(self):
+        gym = self.make_gym()
+        staging = copy_fixture(self, "go-truncate")
+        edit_key(staging, tier="extreme")
+        with self.assertRaises(bk.BugkataError) as cm:
+            bk.encode(gym, staging)
+        self.assertIn("tier", str(cm.exception))
+        self.assertTrue(staging.exists())
+        self.assertFalse((gym / "go").exists())
+
+    def test_decode_writes_bundle(self):
+        gym = self.make_gym()
+        path = bk.encode(gym, copy_fixture(self, "go-truncate"))
+        out = self.tmpdir() / "out"
+        bk.decode(gym, path, out)
+        self.assertEqual(json.loads((out / "key.json").read_text())["slug"], "truncate")
+        self.assertTrue((out / "reference" / "challenge.go").is_file())
+        self.assertTrue((out / "hidden" / "hidden_truncate_test.go").is_file())
+
+    def test_decode_refuses_out_inside_gym(self):
+        gym = self.make_gym()
+        path = bk.encode(gym, copy_fixture(self, "go-truncate"))
+        with self.assertRaises(bk.BugkataError):
+            bk.decode(gym, path, gym / "go" / "spoilers")
+
+
+@unittest.skipUnless(HAS_GO and HAS_PYTEST, "go and pytest needed")
+class RunChallengeTest(TempDirTest):
+    def installed(self, fixture):
+        gym = self.make_gym()
+        return gym, bk.encode(gym, copy_fixture(self, fixture))
+
+    def test_installed_go_challenge_runs_directly(self):
+        gym, path = self.installed("go-truncate")
+        bk.write_go_mod(gym, gym / "go")
+        rel = "./" + path.split("/", 1)[1] + "/"
+        env = {**os.environ, "GOWORK": "off", "GOFLAGS": "-count=1"}
+        for extra in ([], ["-tags", "fixed"]):
+            r = subprocess.run(["go", "test", *extra, rel], cwd=gym / "go", env=env,
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_installed_python_challenge_runs_directly(self):
+        gym, path = self.installed("python-chunk")
+        for target in ("challenge", "fixed"):
+            r = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                cwd=gym / path, capture_output=True, text=True,
+                env={**os.environ, "BUGKATA_TARGET": target, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_run_target_fixed_after_player_edit(self):
+        gym, path = self.installed("go-truncate")
+        fixed = gym / path / "fixed.go"
+        fixed.write_text(fixed.read_text().replace("return s[:n]", "return s"))
+        self.assertEqual(bk.run_challenge(gym, path, "fixed")["tests"], {"TestTruncateASCII": "fail"})
+        self.assertEqual(bk.run_challenge(gym, path, "challenge")["tests"], {"TestTruncateASCII": "pass"})
+
+    def test_run_leaves_gym_untouched(self):
+        gym = self.make_gym()
+        go_path = bk.encode(gym, copy_fixture(self, "go-truncate"))
+        py_path = bk.encode(gym, copy_fixture(self, "python-chunk"))
+
+        def snapshot():
+            temps = [p for p in Path(tempfile.gettempdir()).iterdir() if p.name.startswith("bugkata-")]
+            return sorted(str(p.relative_to(gym)) for p in gym.rglob("*")), len(temps)
+
+        before = snapshot()
+        for path in (go_path, py_path):
+            r = cli(["run", path], cwd=gym / path)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual(out["status"], "ok")
+            self.assertEqual(out["target"], "fixed")
+            self.assertEqual(out["challenge"], path)
+        self.assertEqual(snapshot(), before)
+
+
 if __name__ == "__main__":
     unittest.main()
