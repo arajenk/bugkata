@@ -65,7 +65,7 @@ Write the bundle in a temp dir outside the gym (`mktemp -d`), never inside it:
 
 ## Commands
 
-Run from inside the gym. `<bk>` is `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bugkata.py"`.
+Run from inside the gym. `<bk>` is `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bugkata.py"`. `verify` output can include hidden test names and output, and `decode` unpacks answers, so only the generator (or later, the grader) runs them, never the player's session. Always `verify` before `encode`; `encode` repeats only the static checks.
 
 - `<bk> verify <staging>`: prints `{"ok", "problems", "seconds"}`, exit 0 if ok. Checks:
   - `key.json` fields and the hidden naming rules above

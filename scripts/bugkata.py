@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -60,14 +61,14 @@ def decode_bundle(text: str) -> dict:
 def save_bundle(gym: Path, challenge: str, bundle: dict) -> None:
     path = cache_path(gym, challenge)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(encode_bundle(bundle))
+    path.write_text(encode_bundle(bundle), encoding="utf-8")
 
 
 def load_bundle(gym: Path, challenge: str) -> dict:
     path = cache_path(gym, challenge)
     if not path.is_file():
         raise BugkataError(f"no cached key for {challenge}")
-    return decode_bundle(path.read_text())
+    return decode_bundle(path.read_text(encoding="utf-8"))
 
 
 # ------------------------------------------------------------------- harness
@@ -111,8 +112,40 @@ def make_fixed(lang: str, code: dict[str, str]) -> dict[str, str]:
     return out
 
 
+class ProcessTimeout(Exception):
+    def __init__(self, output: str):
+        super().__init__("process timed out")
+        self.output = output
+
+
+def run_process(cmd: list[str], cwd: Path, env: dict, timeout: float) -> tuple[int, str, str]:
+    """Run cmd, returning (exit code, stdout, stderr).
+
+    The child gets its own process group, so a timeout kills everything it
+    started too (a Go test binary, pytest workers), not just the top process.
+    Raises ProcessTimeout with the output so far, or BugkataError if cmd can't start.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", start_new_session=True,
+        )
+    except OSError as err:
+        raise BugkataError(f"could not run {cmd[0]}: {err}")
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, _ = proc.communicate()
+        raise ProcessTimeout(out or "")
+    return proc.returncode, out, err
+
+
 def _local_go_version() -> str:
-    out = subprocess.run(["go", "env", "GOVERSION"], capture_output=True, text=True).stdout
+    _, out, _ = run_process(["go", "env", "GOVERSION"], Path.cwd(), dict(os.environ), 30)
     m = re.match(r"go(\d+\.\d+)", out.strip())
     if not m:
         raise BugkataError("could not read the local Go version (is go installed?)")
@@ -124,7 +157,7 @@ def write_go_mod(gym: Path, workdir: Path) -> None:
     if gym_mod.is_file():
         shutil.copyfile(gym_mod, workdir / "go.mod")
     else:
-        (workdir / "go.mod").write_text(f"module bugkata-gym\n\ngo {_local_go_version()}\n")
+        (workdir / "go.mod").write_text(f"module bugkata-gym\n\ngo {_local_go_version()}\n", encoding="utf-8")
 
 
 def _tail(text: str) -> str:
@@ -140,18 +173,13 @@ def _run_go(workdir: Path, target: str, race: bool, timeout: int) -> dict:
     cmd.append(".")
     env = {**os.environ, "GOWORK": "off", "GOFLAGS": "", "GOTOOLCHAIN": "local"}
     try:
-        proc = subprocess.run(
-            cmd, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout + 30
-        )
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout or ""
-        if isinstance(out, bytes):
-            out = out.decode(errors="replace")
-        return {"status": "timeout", "tests": {}, "output": _tail(out)}
+        returncode, stdout, stderr = run_process(cmd, workdir, env, timeout + 30)
+    except ProcessTimeout as exc:
+        return {"status": "timeout", "tests": {}, "output": _tail(exc.output)}
 
     tests: dict[str, str] = {}
     text_out = []
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
@@ -167,13 +195,13 @@ def _run_go(workdir: Path, target: str, race: bool, timeout: int) -> dict:
             tests.setdefault(name, "fail")  # started but never finished counts as fail
         elif action in ("pass", "fail", "skip"):
             tests[name] = action
-    output = "\n".join(text_out) + "\n" + proc.stderr
+    output = "\n".join(text_out) + "\n" + stderr
 
     if race and "requires cgo" in output:
         return _run_go(workdir, target, False, timeout)
     if "panic: test timed out" in output:
         return {"status": "timeout", "tests": tests, "output": _tail(output)}
-    if proc.returncode != 0 and not tests:
+    if returncode != 0 and not tests:
         return {"status": "error", "tests": {}, "output": _tail(output)}
     return {"status": "ok", "tests": tests, "output": ""}
 
@@ -195,9 +223,9 @@ sys.modules["target"] = importlib.import_module(_name)
 
 
 def write_python_harness(workdir: Path) -> None:
-    (workdir / "conftest.py").write_text(CONFTEST)
+    (workdir / "conftest.py").write_text(CONFTEST, encoding="utf-8")
     # An inifile here stops pytest from searching parent dirs for config.
-    (workdir / "pytest.ini").write_text("[pytest]\n")
+    (workdir / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
 
 
 def python_executable(gym: Path) -> str:
@@ -223,16 +251,11 @@ def _run_python(gym: Path, workdir: Path, target: str, timeout: int) -> dict:
         ]
         env = {**os.environ, "BUGKATA_TARGET": target, "PYTHONDONTWRITEBYTECODE": "1"}
         try:
-            proc = subprocess.run(
-                cmd, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout
-            )
-        except subprocess.TimeoutExpired as exc:
-            out = exc.stdout or ""
-            if isinstance(out, bytes):
-                out = out.decode(errors="replace")
-            return {"status": "timeout", "tests": {}, "output": _tail(out)}
-        output = proc.stdout + "\n" + proc.stderr
-        if proc.returncode not in (0, 1, 5):
+            returncode, stdout, stderr = run_process(cmd, workdir, env, timeout)
+        except ProcessTimeout as exc:
+            return {"status": "timeout", "tests": {}, "output": _tail(exc.output)}
+        output = stdout + "\n" + stderr
+        if returncode not in (0, 1, 5):
             return {"status": "error", "tests": {}, "output": _tail(output)}
 
         tests: dict[str, str] = {}
@@ -285,6 +308,9 @@ BUG_TEXT_FIELDS = ("category", "location", "what", "why")
 HIDDEN_TEST_PREFIX = {"go": "TestHidden", "python": "test_hidden_"}
 HIDDEN_FILE = {"go": re.compile(r"^hidden_\w+_test\.go$"), "python": re.compile(r"^test_hidden_\w+\.py$")}
 TEST_FUNC = {"go": re.compile(r"^func\s+(Test\w+)", re.M), "python": re.compile(r"^\s*def\s+(test_\w+)", re.M)}
+# Top-level funcs (not methods), types, vars, consts. Hidden files share the
+# package namespace with the player's tests, so these must not clash.
+GO_TOP_LEVEL_NAME = re.compile(r"^(?:func|type|var|const)\s+([A-Za-z_]\w*)", re.M)
 IMPORTS_CHALLENGE = re.compile(r"^\s*(from|import)\s+challenge\b", re.M)
 
 
@@ -292,10 +318,17 @@ def _read_tree(root: Path) -> dict[str, str]:
     if not root.is_dir():
         return {}
     return {
-        p.relative_to(root).as_posix(): p.read_text()
+        p.relative_to(root).as_posix(): _read_text(p)
         for p in sorted(root.rglob("*"))
         if p.is_file() and "__pycache__" not in p.parts and ".pytest_cache" not in p.parts
     }
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise BugkataError(f"{path} is not UTF-8 text; challenges hold text files only")
 
 
 def read_staging(staging: Path) -> dict:
@@ -303,7 +336,7 @@ def read_staging(staging: Path) -> dict:
     if not key_file.is_file():
         raise BugkataError(f"{staging} has no key.json")
     try:
-        key = json.loads(key_file.read_text())
+        key = json.loads(key_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as err:
         raise BugkataError(f"key.json is not valid JSON: {err}")
     return {
@@ -317,15 +350,23 @@ def read_staging(staging: Path) -> dict:
 def stage_workdir(gym: Path, lang: str, files: dict[str, str]) -> Path:
     """Write `files` plus the language harness into a new temp dir. Caller deletes it."""
     workdir = Path(tempfile.mkdtemp(prefix="bugkata-"))
-    for rel, text in files.items():
-        dest = workdir / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text)
+    try:
+        for rel, text in files.items():
+            dest = workdir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text, encoding="utf-8")
+        _write_harness(gym, lang, workdir)
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)  # it may hold hidden tests and reference code
+        raise
+    return workdir
+
+
+def _write_harness(gym: Path, lang: str, workdir: Path) -> None:
     if lang == "go":
         write_go_mod(gym, workdir)
     else:
         write_python_harness(workdir)
-    return workdir
 
 
 def _key_problems(key: dict) -> list[str]:
@@ -397,6 +438,10 @@ def _layout_problems(lang: str, staged: dict) -> list[str]:
         for name in TEST_FUNC[lang].findall(text):
             if not name.startswith(prefix):
                 problems.append(f"layout: hidden test {name} must start with {prefix}")
+        if lang == "go":
+            for name in GO_TOP_LEVEL_NAME.findall(text):
+                if not name.startswith(("hidden", "Hidden", "TestHidden")):
+                    problems.append(f"layout: hidden helper {name} in hidden/{rel} must start with hidden")
     for rel, text in visible.items():
         if rel.endswith((".go", ".py")):
             for name in TEST_FUNC[lang].findall(text):
@@ -564,7 +609,7 @@ def encode(gym: Path, staging: Path) -> str:
         for rel, text in files.items():
             dest = folder / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(text)
+            dest.write_text(text, encoding="utf-8")
         save_bundle(gym, challenge, {
             "version": 1,
             "challenge": challenge,
@@ -586,25 +631,22 @@ def decode(gym: Path, challenge: str, out: Path) -> None:
     challenge = challenge.strip().strip("/")
     bundle = load_bundle(gym, challenge)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "key.json").write_text(json.dumps(bundle["key"], indent=2) + "\n")
+    (out / "key.json").write_text(json.dumps(bundle["key"], indent=2) + "\n", encoding="utf-8")
     for part in ("reference", "hidden"):
         for rel, text in bundle[part].items():
             dest = out / part / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(text)
+            dest.write_text(text, encoding="utf-8")
 
 
 def run_challenge(gym: Path, challenge: str, target: str, timeout: int = 120) -> dict:
     """Run an installed challenge's visible and player tests (never hidden ones)."""
     challenge, folder = _check_challenge(gym, challenge)
     lang = challenge.split("/", 1)[0]
-    workdir = stage_workdir(gym, lang, {})
+    workdir = Path(tempfile.mkdtemp(prefix="bugkata-"))
     try:
         shutil.copytree(folder, workdir, dirs_exist_ok=True, ignore=shutil.ignore_patterns(*SKIP_DIRS))
-        if lang == "go":
-            write_go_mod(gym, workdir)
-        else:
-            write_python_harness(workdir)
+        _write_harness(gym, lang, workdir)
         return run_tests(gym, lang, workdir, target, timeout=timeout)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

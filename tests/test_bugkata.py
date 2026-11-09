@@ -296,6 +296,67 @@ class VerifyRunTest(TempDirTest):
         self.assertFalse(json.loads(r.stdout)["ok"])
 
 
+def bugkata_temp_count() -> int:
+    return sum(1 for p in Path(tempfile.gettempdir()).iterdir() if p.name.startswith("bugkata-"))
+
+
+class ReviewFixTest(TempDirTest):
+    def test_go_hidden_helper_must_use_prefix(self):
+        staging = copy_fixture(self, "go-truncate")
+        with open(staging / "hidden" / "hidden_truncate_test.go", "a") as f:
+            f.write("\nfunc assertEq(t *testing.T, a, b string) {}\n")
+        assert_problem(self, bk.verify(self.make_gym(), staging), "hidden helper assertEq")
+
+    def test_timeout_kills_grandchildren(self):
+        import time
+
+        child = (
+            "import subprocess, sys, time\n"
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "print(p.pid, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        with self.assertRaises(bk.ProcessTimeout) as cm:
+            bk.run_process([sys.executable, "-c", child], cwd=self.tmpdir(), env=dict(os.environ), timeout=2)
+        grandchild = int(cm.exception.output.split()[0])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
+        os.kill(grandchild, 9)
+        self.fail("grandchild still running after timeout")
+
+    @unittest.skipUnless(HAS_PYTEST, "pytest not installed")
+    def test_python_hang_times_out(self):
+        gym = self.make_gym()
+        work = stage(self, gym, "python-chunk")
+        (work / "test_hidden_hang.py").write_text("def test_hidden_hang():\n    while True:\n        pass\n")
+        self.assertEqual(bk.run_tests(gym, "python", work, "challenge", timeout=2)["status"], "timeout")
+
+    def test_missing_interpreter_is_a_clean_error(self):
+        gym = self.make_gym()
+        work = self.tmpdir()
+        with mock.patch.dict(os.environ, {"BUGKATA_PYTHON": "/nonexistent/python"}):
+            with self.assertRaises(bk.BugkataError):
+                bk.run_tests(gym, "python", work, "fixed")
+
+    def test_stage_workdir_cleans_up_on_failure(self):
+        before = bugkata_temp_count()
+        with mock.patch.object(bk, "_local_go_version", side_effect=bk.BugkataError("no go")):
+            with self.assertRaises(bk.BugkataError):
+                bk.stage_workdir(self.make_gym(), "go", {"hidden_a_test.go": "secret"})
+        self.assertEqual(bugkata_temp_count(), before)
+
+    def test_binary_file_in_staging_is_a_clean_error(self):
+        staging = copy_fixture(self, "go-truncate")
+        (staging / "visible" / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+        with self.assertRaises(bk.BugkataError):
+            bk.read_staging(staging)
+
+
 class EncodeTest(TempDirTest):
     def test_encode_go_installs_challenge(self):
         gym = self.make_gym()
