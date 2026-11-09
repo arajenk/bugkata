@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -268,10 +269,256 @@ def run_tests(
     raise BugkataError(f"unknown language {lang}")
 
 
+# --------------------------------------------------------------------- verify
+#
+# A staging bundle, written by the generator in a temp dir outside the gym:
+#   key.json    answer key (lang, slug, mode, tier, bugs)
+#   visible/    what the player gets
+#   reference/  fixed versions of the code files in visible/, same paths
+#   hidden/     grading tests
+
+LANGS = ("go", "python")
+MODES = ("audit", "debug", "review", "test-review")
+TIERS = ("easy", "medium", "hard")
+SLUG = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+BUG_TEXT_FIELDS = ("category", "location", "what", "why")
+HIDDEN_TEST_PREFIX = {"go": "TestHidden", "python": "test_hidden_"}
+HIDDEN_FILE = {"go": re.compile(r"^hidden_\w+_test\.go$"), "python": re.compile(r"^test_hidden_\w+\.py$")}
+TEST_FUNC = {"go": re.compile(r"^func\s+(Test\w+)", re.M), "python": re.compile(r"^\s*def\s+(test_\w+)", re.M)}
+IMPORTS_CHALLENGE = re.compile(r"^\s*(from|import)\s+challenge\b", re.M)
+
+
+def _read_tree(root: Path) -> dict[str, str]:
+    if not root.is_dir():
+        return {}
+    return {
+        p.relative_to(root).as_posix(): p.read_text()
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and "__pycache__" not in p.parts and ".pytest_cache" not in p.parts
+    }
+
+
+def read_staging(staging: Path) -> dict:
+    key_file = staging / "key.json"
+    if not key_file.is_file():
+        raise BugkataError(f"{staging} has no key.json")
+    try:
+        key = json.loads(key_file.read_text())
+    except json.JSONDecodeError as err:
+        raise BugkataError(f"key.json is not valid JSON: {err}")
+    return {
+        "key": key,
+        "visible": _read_tree(staging / "visible"),
+        "reference": _read_tree(staging / "reference"),
+        "hidden": _read_tree(staging / "hidden"),
+    }
+
+
+def stage_workdir(gym: Path, lang: str, files: dict[str, str]) -> Path:
+    """Write `files` plus the language harness into a new temp dir. Caller deletes it."""
+    workdir = Path(tempfile.mkdtemp(prefix="bugkata-"))
+    for rel, text in files.items():
+        dest = workdir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text)
+    if lang == "go":
+        write_go_mod(gym, workdir)
+    else:
+        write_python_harness(workdir)
+    return workdir
+
+
+def _key_problems(key: dict) -> list[str]:
+    problems = []
+    if not isinstance(key, dict):
+        return ["key.json: must be an object"]
+    lang = key.get("lang")
+    if lang not in LANGS:
+        problems.append(f"key.json: lang must be one of {', '.join(LANGS)}")
+    if not isinstance(key.get("slug"), str) or not SLUG.match(key["slug"]):
+        problems.append("key.json: slug must be lowercase words joined by hyphens")
+    if key.get("mode") not in MODES:
+        problems.append(f"key.json: mode must be one of {', '.join(MODES)}")
+    if key.get("tier") not in TIERS:
+        problems.append(f"key.json: tier must be one of {', '.join(TIERS)}")
+    bugs = key.get("bugs")
+    if not isinstance(bugs, list) or not bugs:
+        problems.append("key.json: bugs must be a nonempty list")
+        return problems
+    seen_ids, seen_tests = set(), set()
+    for i, bug in enumerate(bugs):
+        if not isinstance(bug, dict):
+            problems.append(f"key.json: bug {i} must be an object")
+            continue
+        bid = bug.get("id")
+        if not isinstance(bid, str) or not bid:
+            problems.append(f"key.json: bug {i}: id missing")
+            bid = str(i)
+        elif bid in seen_ids:
+            problems.append(f"key.json: bug {bid}: duplicate id")
+        seen_ids.add(bid)
+        for field in BUG_TEXT_FIELDS:
+            if not isinstance(bug.get(field), str) or not bug[field].strip():
+                problems.append(f"key.json: bug {bid}: {field} missing")
+        tests = bug.get("tests")
+        if not isinstance(tests, list) or not tests or not all(isinstance(t, str) for t in tests):
+            problems.append(f"key.json: bug {bid}: tests must be a nonempty list of names")
+            continue
+        for t in tests:
+            if t in seen_tests:
+                problems.append(f"key.json: bug {bid}: {t} is listed under another bug")
+            seen_tests.add(t)
+            if lang in LANGS and not t.startswith(HIDDEN_TEST_PREFIX[lang]):
+                problems.append(f"key.json: bug {bid}: {t} must start with {HIDDEN_TEST_PREFIX[lang]}")
+    return problems
+
+
+def _layout_problems(lang: str, staged: dict) -> list[str]:
+    visible, reference, hidden = staged["visible"], staged["reference"], staged["hidden"]
+    problems = []
+    if "spec.md" not in visible:
+        problems.append("layout: visible/spec.md missing")
+    code = {rel for rel in visible if is_code_file(lang, rel)}
+    if not code:
+        problems.append("layout: visible/ has no challenge code files")
+    if set(reference) != code:
+        problems.append(
+            "layout: reference/ must hold exactly the code files in visible/ "
+            f"(visible: {sorted(code)}, reference: {sorted(reference)})"
+        )
+    if not hidden:
+        problems.append("layout: hidden/ has no test files")
+    prefix = HIDDEN_TEST_PREFIX[lang]
+    for rel, text in hidden.items():
+        if not HIDDEN_FILE[lang].match(rel):
+            problems.append(f"layout: hidden/{rel} must be named like {HIDDEN_FILE[lang].pattern}")
+        if rel in visible:
+            problems.append(f"layout: hidden/{rel} clashes with a visible file")
+        for name in TEST_FUNC[lang].findall(text):
+            if not name.startswith(prefix):
+                problems.append(f"layout: hidden test {name} must start with {prefix}")
+    for rel, text in visible.items():
+        if rel.endswith((".go", ".py")):
+            for name in TEST_FUNC[lang].findall(text):
+                if name.startswith(prefix):
+                    problems.append(f"layout: visible test {name} uses the hidden prefix {prefix}")
+    if "conftest.py" in visible:
+        problems.append("layout: visible/conftest.py is written by bugkata, remove it")
+
+    if lang == "go":
+        for rel in visible:
+            if not rel.endswith(".go"):
+                continue
+            if "/" in rel:
+                problems.append(f"layout: visible/{rel}: Go files must sit at the top level")
+            elif rel.startswith("fixed"):
+                problems.append(f"layout: visible/{rel}: fixed copies are made by bugkata")
+            elif not rel.endswith("_test.go") and rel not in code:
+                problems.append(f"layout: visible/{rel}: non-test Go files must be named challenge*.go")
+        for side, files in (("visible", visible), ("reference", reference)):
+            for rel in sorted(code & set(files)):
+                if files[rel].partition("\n")[0].strip() != GO_TAG_CHALLENGE:
+                    problems.append(f"layout: {side}/{rel}: first line must be `{GO_TAG_CHALLENGE}`")
+    else:
+        if "challenge/__init__.py" not in visible:
+            problems.append("layout: visible/challenge/__init__.py missing")
+        if any(rel.startswith("fixed/") for rel in visible):
+            problems.append("layout: visible/fixed/ is made by bugkata, remove it")
+        for side, files in (("visible", visible), ("reference", reference), ("hidden", hidden)):
+            for rel, text in files.items():
+                if rel.endswith(".py") and IMPORTS_CHALLENGE.search(text):
+                    problems.append(
+                        f"layout: {side}/{rel} imports challenge "
+                        "(tests import target; package code uses relative imports)"
+                    )
+    return problems
+
+
+def static_problems(staged: dict) -> list[str]:
+    problems = _key_problems(staged["key"])
+    if problems:
+        return problems
+    return _layout_problems(staged["key"]["lang"], staged)
+
+
+def _tier_problems(tier: str, visible_results: dict[str, str]) -> list[str]:
+    failing = sorted(t for t, r in visible_results.items() if r != "pass")
+    if tier == "easy":
+        return [] if failing else ["tier easy: no visible test fails on challenge"]
+    problems = [f"tier {tier}: visible {t} fails on challenge" for t in failing]
+    if tier == "medium" and not visible_results:
+        problems.append("tier medium: no visible tests")
+    return problems
+
+
+def verify(gym: Path, staging: Path, repeat: int = 3, timeout: int = 120) -> list[str]:
+    """Check a staging bundle. Returns problems; an empty list means it's sound."""
+    staged = read_staging(staging)
+    problems = static_problems(staged)
+    if problems:
+        return problems
+    key = staged["key"]
+    lang = key["lang"]
+    prefix = HIDDEN_TEST_PREFIX[lang]
+    files = {**staged["visible"], **staged["hidden"], **make_fixed(lang, staged["reference"])}
+
+    workdir = stage_workdir(gym, lang, files)
+    try:
+        runs = {"fixed": [], "challenge": []}
+        for _ in range(max(1, repeat)):
+            for target in ("fixed", "challenge"):
+                result = run_tests(
+                    gym, lang, workdir, target, race=(lang == "go" and target == "fixed"),
+                    timeout=timeout,
+                )
+                if result["status"] != "ok":
+                    label = "reference" if target == "fixed" else "challenge"
+                    return [f"{label}: {result['status']}: {result['output']}"]
+                runs[target].append(result["tests"])
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    for target, results in runs.items():
+        for name in sorted(set().union(*results)):
+            if len({r.get(name) for r in results}) > 1:
+                problems.append(f"flaky: {name} ({'reference' if target == 'fixed' else 'challenge'})")
+    ref, chal = runs["fixed"][0], runs["challenge"][0]
+
+    for name, result in sorted(ref.items()):
+        if result != "pass":
+            problems.append(f"{name} fails on reference")
+    key_tests = set()
+    for bug in key["bugs"]:
+        for t in bug["tests"]:
+            key_tests.add(t)
+            if t not in chal:
+                problems.append(f"bug {bug['id']}: {t} not found")
+            elif chal[t] != "fail":
+                problems.append(f"bug {bug['id']}: {t} passes on challenge")
+    for name, result in sorted(chal.items()):
+        if name.startswith(prefix) and name not in key_tests and result != "pass":
+            problems.append(f"hidden {name} fails on challenge but is not in the key")
+    visible_results = {n: r for n, r in chal.items() if not n.startswith(prefix)}
+    problems += _tier_problems(key["tier"], visible_results)
+    return problems
+
+
 # ------------------------------------------------------------------------ CLI
 
 def _not_built(args) -> int:
     raise BugkataError(f"{args.command} is not built yet")
+
+
+def _print(obj: dict) -> None:
+    print(json.dumps(obj, indent=2))
+
+
+def _cmd_verify(args) -> int:
+    gym = find_gym(Path.cwd())
+    start = time.monotonic()
+    problems = verify(gym, Path(args.staging), repeat=args.repeat, timeout=args.timeout)
+    _print({"ok": not problems, "problems": problems, "seconds": round(time.monotonic() - start, 1)})
+    return 0 if not problems else 1
 
 
 def _cmd_run(args) -> int:
@@ -285,7 +532,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     v = sub.add_parser("verify")
     v.add_argument("staging")
-    v.set_defaults(func=_not_built)
+    v.add_argument("--repeat", type=int, default=3)
+    v.add_argument("--timeout", type=int, default=120)
+    v.set_defaults(func=_cmd_verify)
 
     e = sub.add_parser("encode")
     e.add_argument("staging")

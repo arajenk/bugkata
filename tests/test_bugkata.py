@@ -1,10 +1,12 @@
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,6 +19,9 @@ _spec.loader.exec_module(bk)
 
 HAS_GO = shutil.which("go") is not None
 HAS_PYTEST = importlib.util.find_spec("pytest") is not None
+
+# Tests run the gym's Python harness with this interpreter instead of a gym venv.
+os.environ.setdefault("BUGKATA_PYTHON", sys.executable)
 
 
 class TempDirTest(unittest.TestCase):
@@ -33,8 +38,6 @@ class TempDirTest(unittest.TestCase):
 
 
 def cli(args, cwd, env=None):
-    import os
-
     full_env = dict(os.environ)
     full_env.update(env or {})
     return subprocess.run(
@@ -160,16 +163,6 @@ class GoHarnessTest(TempDirTest):
 
 @unittest.skipUnless(HAS_PYTEST, "pytest not installed")
 class PythonHarnessTest(TempDirTest):
-    def setUp(self):
-        import os
-
-        old = os.environ.get("BUGKATA_PYTHON")
-        os.environ["BUGKATA_PYTHON"] = sys.executable
-        self.addCleanup(
-            lambda: os.environ.pop("BUGKATA_PYTHON", None) if old is None
-            else os.environ.__setitem__("BUGKATA_PYTHON", old)
-        )
-
     def test_python_make_fixed_moves_package(self):
         out = bk.make_fixed("python", {"challenge/__init__.py": "x = 1\n", "challenge/a.py": "y\n"})
         self.assertEqual(out, {"fixed/__init__.py": "x = 1\n", "fixed/a.py": "y\n"})
@@ -201,11 +194,106 @@ class PythonHarnessTest(TempDirTest):
         self.assertTrue(r["output"])
 
     def test_python_executable_missing(self):
-        import os
+        with mock.patch.dict(os.environ):
+            os.environ.pop("BUGKATA_PYTHON", None)
+            with self.assertRaises(bk.BugkataError):
+                bk.python_executable(self.make_gym())
 
-        os.environ.pop("BUGKATA_PYTHON")
-        with self.assertRaises(bk.BugkataError):
-            bk.python_executable(self.make_gym())
+
+def copy_fixture(test: TempDirTest, fixture: str) -> Path:
+    staging = test.tmpdir() / "staging"
+    shutil.copytree(FIXTURES / fixture, staging)
+    return staging
+
+
+def edit_key(staging: Path, **changes) -> None:
+    key = json.loads((staging / "key.json").read_text())
+    key.update(changes)
+    (staging / "key.json").write_text(json.dumps(key))
+
+
+def assert_problem(test, problems, needle):
+    test.assertTrue(any(needle in p for p in problems), f"{needle!r} not in {problems}")
+
+
+class VerifyStaticTest(TempDirTest):
+    def test_bad_key_fields(self):
+        staging = copy_fixture(self, "go-truncate")
+        key = json.loads((staging / "key.json").read_text())
+        key["tier"] = "extreme"
+        del key["bugs"][0]["why"]
+        (staging / "key.json").write_text(json.dumps(key))
+        problems = bk.verify(self.make_gym(), staging)
+        assert_problem(self, problems, "key.json: tier")
+        assert_problem(self, problems, "key.json: bug b1: why")
+        self.assertEqual(len(problems), 2, problems)
+
+    def test_reference_file_set_mismatch(self):
+        staging = copy_fixture(self, "go-truncate")
+        (staging / "reference" / "challenge_extra.go").write_text("//go:build !fixed\n\npackage truncate\n")
+        assert_problem(self, bk.verify(self.make_gym(), staging), "layout:")
+
+    def test_visible_test_with_hidden_prefix_rejected(self):
+        staging = copy_fixture(self, "go-truncate")
+        with open(staging / "visible" / "truncate_test.go", "a") as f:
+            f.write("\nfunc TestHiddenX(t *testing.T) {}\n")
+        assert_problem(self, bk.verify(self.make_gym(), staging), "TestHidden")
+
+    def test_python_test_importing_challenge_rejected(self):
+        staging = copy_fixture(self, "python-chunk")
+        test = staging / "visible" / "test_chunk.py"
+        test.write_text(test.read_text().replace("from target import", "from challenge import"))
+        assert_problem(self, bk.verify(self.make_gym(), staging), "imports challenge")
+
+
+@unittest.skipUnless(HAS_GO and HAS_PYTEST, "go and pytest needed")
+class VerifyRunTest(TempDirTest):
+    def test_verify_go_fixture_ok(self):
+        self.assertEqual(bk.verify(self.make_gym(), copy_fixture(self, "go-truncate"), repeat=1), [])
+
+    def test_verify_python_fixture_ok(self):
+        staging = copy_fixture(self, "python-chunk")
+        self.assertEqual(bk.verify(self.make_gym(), staging, repeat=2), [])
+
+    def test_bug_test_passing_on_challenge(self):
+        staging = copy_fixture(self, "go-truncate")
+        shutil.copyfile(staging / "reference" / "challenge.go", staging / "visible" / "challenge.go")
+        assert_problem(
+            self,
+            bk.verify(self.make_gym(), staging, repeat=1),
+            "bug b1: TestHiddenTruncateMultibyte passes on challenge",
+        )
+
+    def test_key_test_typo(self):
+        staging = copy_fixture(self, "go-truncate")
+        key = json.loads((staging / "key.json").read_text())
+        key["bugs"][0]["tests"] = ["TestHiddenTypo"]
+        (staging / "key.json").write_text(json.dumps(key))
+        problems = bk.verify(self.make_gym(), staging, repeat=1)
+        assert_problem(self, problems, "bug b1: TestHiddenTypo not found")
+        assert_problem(self, problems, "TestHiddenTruncateMultibyte fails on challenge but is not in the key")
+
+    def test_reference_broken(self):
+        staging = copy_fixture(self, "go-truncate")
+        ref = staging / "reference" / "challenge.go"
+        ref.write_text(ref.read_text().replace("return string(r[:n])", "return string(r[:n]) + \"!\""))
+        assert_problem(self, bk.verify(self.make_gym(), staging, repeat=1), "TestTruncateASCII fails on reference")
+
+    def test_tier_easy_needs_failing_visible(self):
+        staging = copy_fixture(self, "go-truncate")
+        edit_key(staging, tier="easy")
+        assert_problem(self, bk.verify(self.make_gym(), staging, repeat=1), "tier easy")
+
+    def test_cli_verify_exit_codes(self):
+        gym = self.make_gym()
+        r = cli(["verify", str(copy_fixture(self, "go-truncate")), "--repeat", "1"], cwd=gym)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(json.loads(r.stdout)["ok"])
+        broken = copy_fixture(self, "go-truncate")
+        edit_key(broken, tier="easy")
+        r = cli(["verify", str(broken), "--repeat", "1"], cwd=gym)
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(json.loads(r.stdout)["ok"])
 
 
 if __name__ == "__main__":
