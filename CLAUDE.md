@@ -44,6 +44,8 @@ scripts/
 └── bugkata.py               # stdlib only: encode/decode, verify, run, score, rate
 agents/
 └── challenge-reviewer.md
+hooks/
+└── hooks.json               # blocks direct access to the answer cache
 README.md
 LICENSE
 ```
@@ -74,6 +76,14 @@ Gym `.bugkata/`:
 - `state.json`: current focus, current challenge, per-language counters
 - `cache/`: answer keys, reference fixes, hidden tests, prefetched challenge. Hash-named and base64-encoded; light obfuscation only.
 
+Spoiler protection is layered, and aims at accidental spoilers, not determined cheaters (cheating only cheats yourself):
+1. Generation runs in a separate context, so the player's session never sees the key.
+2. A `PreToolUse` hook blocks Read, Grep, and Bash access to `.bugkata/cache/` except through `bugkata.py`. Claude Code enforces this, so it doesn't depend on Claude following instructions.
+3. `bugkata.py` never prints answers outside `hint`, `skip`, and `submit` output.
+4. A rule in `references/core.md` as a backup.
+
+Claude can still read the challenge code and find the bugs itself if asked. That's solving the puzzle for the player, not a leak.
+
 ## Modes
 Mode rotates by default toward weak spots. Args override (`/bugkata:start debug`, `/bugkata:start go review hard`). Rotation and args only offer modes that are built; `references/modes.md` lists which ones are live.
 
@@ -98,9 +108,12 @@ go/014-rate-limiter/
 Numbering is per language. Go selects the target with build tags (`go test` vs `go test -tags fixed`); challenge files carry `//go:build !fixed`, and the `fixed*.go` copies get the tag flipped to `fixed`. Python uses `challenge/` and `fixed/` packages selected by an env var in `conftest.py`. Full details live in the harness refs. To grade, the code and hidden tests are copied into a temp dir outside the gym, run, and deleted.
 
 ## Bug catalog
-`references/bug-catalog.md` has Go and Python examples for each category:
-- Spec mismatch: solves a nearby problem, or handles the examples but not the requirements
-- Wrong API/library assumptions: in-place vs copy, nil/None returns, thread safety, mutability
+`references/bug-catalog.md` has Go and Python examples for each category. The AI-specific categories follow Tambon et al., "Bugs in Large Language Models Generated Code" (arXiv 2403.08937).
+- Spec mismatch: solves a nearby problem instead of the one asked
+- Overfit to the examples: handles the cases shown in the spec's examples but not the general requirement
+- Unrequested behavior: does something the spec never asked for, and the extra part breaks something
+- Incomplete wiring: a piece exists but isn't connected (config read but unused, error path stubbed out)
+- Wrong or made-up API assumptions: in-place vs copy, nil/None returns, thread safety, mutability, wrong attribute. In Python, a method that doesn't exist, which only fails on the path that calls it.
 - Edge cases: empty input, boundaries, unicode, time zones/DST, floats, overflow
 - Error handling: swallowed errors, partial failure leaving bad state, non-idempotent retries
 - State and lifecycle: stale caches, init order, leaks, double close
@@ -119,6 +132,16 @@ Tiers measure effort, not length. A Hard challenge shouldn't take much longer th
 - symptoms far from the cause (Debug)
 - trivial bug categories banned
 
+Visible tests by tier. They may be incomplete, but they never contradict `spec.md`:
+
+| Tier | Visible tests |
+|---|---|
+| Easy | real tests, at least one failing, pointing at a bug |
+| Medium | real happy-path tests that all pass; bugs live in what they don't cover |
+| Hard | weak passing tests or none; the player writes their own |
+
+Hidden tests always do the grading.
+
 Selection targets a challenge rating D slightly above the player's rating R (about R + 50). Tier is derived from D using bands in `references/difficulty.md`; a tier arg sets D to that band's midpoint. Solve quality drives difficulty. Time is a secondary nudge: if a tier's median time falls well under target, the next challenge uses more levers.
 
 Elo, tracked per mode × language:
@@ -128,7 +151,7 @@ Elo, tracked per mode × language:
 - A new mode × language starts from the player's other ratings in that language, or the tutorial result if there are none.
 
 ## Generation pipeline
-Generation runs in a separate subagent so the player's session never sees the answer key. The subagent returns only the challenge path and a one-line status, never code, bugs, or test contents. As a backup, `references/core.md` forbids discussing a challenge's bugs outside `hint`, `skip`, and `submit`.
+Generation runs in a separate subagent (spoiler layer 1, see State). It returns only the challenge path and a one-line status, never code, bugs, or test contents.
 
 1. Pick mode, target D, and bug categories weighted toward weak spots, or serve a due retry.
 2. Write correct, idiomatic code and `spec.md`, then inject bugs and decoys. No tells: no hint comments, odd names, or style shifts.
@@ -197,7 +220,7 @@ One short Easy Audit in the user's first language. Hints are free and offered up
 
 ## Build plan
 Small diffs, each reviewed.
-1. Plugin skeleton with `start`, `help`, and a `hint` stub. Confirm install, that `start` triggers from plain English while `hint` doesn't, `/bugkata:<skill>` naming, args passing, shared-file references, and whether a background subagent can finish work after the turn ends (for prefetch).
+1. Plugin skeleton with `start`, `help`, and a `hint` stub. Confirm install, that `start` triggers from plain English while `hint` doesn't, `/bugkata:<skill>` naming, args passing, shared-file references, that a plugin `PreToolUse` hook can block reads of a folder, and whether a background subagent can finish work after the turn ends (for prefetch).
 2. Harness refs (Go, Python, including the Go build-tag flip) and `bugkata.py` encode/decode/verify/run.
 3. `references/core.md`, `start` (gym setup, launch, Audit generation), and `submit`.
 4. `references/bug-catalog.md`.
