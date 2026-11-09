@@ -1,0 +1,9 @@
+{
+  "name": "bugkata",
+  "version": "0.1.0",
+  "description": "a Claude Code plugin to practice reviewing and debugging realistic code",
+  "author": { "name": "Arajen Kajanthirabalan" },
+  "repository": "https://github.com/arajenk/bugkata",
+  "license": "MIT",
+  "keywords": ["code-review", "debugging", "practice"]
+}

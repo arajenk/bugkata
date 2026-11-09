@@ -1,0 +1,14 @@
+{
+  "name": "bugkata",
+  "owner": { "name": "Arajen Kajanthirabalan" },
+  "metadata": {
+    "description": "a Claude Code plugin to practice reviewing and debugging realistic code"
+  },
+  "plugins": [
+    {
+      "name": "bugkata",
+      "source": "./",
+      "description": "a Claude Code plugin to practice reviewing and debugging realistic code"
+    }
+  ]
+}
