@@ -49,7 +49,12 @@ hooks/
 README.md
 LICENSE
 ```
-`hint`, `skip`, `submit`, and `reset` set `disable-model-invocation: true` so they only run when typed; an auto-fired hint or reveal would spoil a challenge or cost points. `start`, `help`, `stats`, and `config` can trigger from plain English ("give me a go challenge", "how am I doing?"). Skills stay thin and point to `references/` and `scripts/`; how a skill references files outside its own folder (e.g. `${CLAUDE_PLUGIN_ROOT}`) and how args are passed is verified in build step 1.
+`hint`, `skip`, `submit`, and `reset` set `disable-model-invocation: true` so they only run when typed; an auto-fired hint or reveal would spoil a challenge or cost points. `start`, `help`, `stats`, and `config` can trigger from plain English ("give me a go challenge", "how am I doing?"). Skills stay thin and point to `references/` and `scripts/`.
+
+Plugin mechanics (verified in build step 1, on a real GitHub install):
+- `${CLAUDE_PLUGIN_ROOT}` and `$ARGUMENTS` are substituted in SKILL.md text. `CLAUDE_PLUGIN_ROOT` is empty in Bash, so skills write paths with the text form (`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bugkata.py"`). Hooks do get it as an env var.
+- Args arrive raw (spacing and quotes kept); skills normalize them.
+- `disable-model-invocation` works, but Claude may route a plain-English "give me a hint" to `start` instead. `start` must redirect hint/skip/submit/reset requests to the typed command and never act on them.
 
 ## The gym
 Users practice in a dedicated gym repo, never a real project. One gym, one folder per language:
@@ -165,7 +170,7 @@ Generation runs in a separate subagent (spoiler layer 1, see State). It returns 
 ## Token budget
 - Scripts handle verify, run, score, rate, and encode.
 - The reviewer uses a cheaper model by default (set in `config.json`).
-- Prefetch at most one challenge, never a pool. Generate it in the background after submit or skip, cache it, and serve it on the next matching launch, including in a later session. `prefetch: false` turns this off. If background generation turns out not to work (checked in build step 1), fall back to generating at the next `start`.
+- Prefetch at most one challenge, never a pool. Generate it in the background after submit or skip, cache it, and serve it on the next matching launch, including in a later session. `prefetch: false` turns this off. A background job finishes if the session stays open but dies if the user quits (verified in build step 1), so a prefetch is written to a temp name and only marked ready once complete; anything unfinished is discarded and `start` generates fresh.
 - Code size grows with tier only as needed; difficulty comes from levers, not volume.
 - Generation latency is logged per challenge so the user can judge the cost/latency tradeoff.
 
@@ -220,7 +225,7 @@ One short Easy Audit in the user's first language. Hints are free and offered up
 
 ## Build plan
 Small diffs, each reviewed.
-1. Plugin skeleton with `start`, `help`, and a `hint` stub. Confirm install, that `start` triggers from plain English while `hint` doesn't, `/bugkata:<skill>` naming, args passing, shared-file references, that a plugin `PreToolUse` hook can block reads of a folder, and whether a background subagent can finish work after the turn ends (for prefetch).
+1. ✅ Done. Plugin skeleton with `start`, `help`, and a `hint` stub. Confirm install, that `start` triggers from plain English while `hint` doesn't, `/bugkata:<skill>` naming, args passing, shared-file references, that a plugin `PreToolUse` hook can block reads of a folder, and whether a background subagent can finish work after the turn ends (for prefetch).
 2. Harness refs (Go, Python, including the Go build-tag flip) and `bugkata.py` encode/decode/verify/run.
 3. `references/core.md`, `start` (gym setup, launch, Audit generation), and `submit`.
 4. `references/bug-catalog.md`.
