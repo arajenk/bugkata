@@ -83,5 +83,80 @@ class GymAndCacheTest(TempDirTest):
         self.assertIn("bugkata: not inside a bugkata gym", r.stderr)
 
 
+def read_tree(root: Path) -> dict:
+    return {
+        p.relative_to(root).as_posix(): p.read_text()
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and "__pycache__" not in p.parts
+    }
+
+
+def stage(test: TempDirTest, gym: Path, fixture: str) -> Path:
+    """Build a run-ready workdir: visible + hidden + fixed copies of reference."""
+    src = FIXTURES / fixture
+    lang = json.loads((src / "key.json").read_text())["lang"]
+    work = test.tmpdir()
+    files = {**read_tree(src / "visible"), **read_tree(src / "hidden")}
+    files.update(bk.make_fixed(lang, read_tree(src / "reference")))
+    for rel, text in files.items():
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text(text)
+    if lang == "go":
+        bk.write_go_mod(gym, work)
+    else:
+        bk.write_python_harness(work)
+    return work
+
+
+class GoHarnessTest(TempDirTest):
+    def test_go_make_fixed_flips_tag_and_name(self):
+        out = bk.make_fixed("go", {"challenge_store.go": "//go:build !fixed\n\npackage x\n"})
+        self.assertEqual(out, {"fixed_store.go": "//go:build fixed\n\npackage x\n"})
+
+    def test_go_make_fixed_requires_tag(self):
+        with self.assertRaises(bk.BugkataError):
+            bk.make_fixed("go", {"challenge.go": "package x\n"})
+
+    @unittest.skipUnless(HAS_GO, "go not installed")
+    def test_go_run_challenge_and_fixed(self):
+        gym = self.make_gym()
+        work = stage(self, gym, "go-truncate")
+        r = bk.run_tests(gym, "go", work, "challenge")
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(
+            r["tests"], {"TestTruncateASCII": "pass", "TestHiddenTruncateMultibyte": "fail"}
+        )
+        r = bk.run_tests(gym, "go", work, "fixed")
+        self.assertEqual(
+            r["tests"], {"TestTruncateASCII": "pass", "TestHiddenTruncateMultibyte": "pass"}
+        )
+
+    @unittest.skipUnless(HAS_GO, "go not installed")
+    def test_go_build_error(self):
+        gym = self.make_gym()
+        work = stage(self, gym, "go-truncate")
+        (work / "fixed.go").write_text("//go:build fixed\n\npackage truncate\n\nfunc Truncate(\n")
+        r = bk.run_tests(gym, "go", work, "fixed")
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["tests"], {})
+        self.assertTrue(r["output"])
+
+    @unittest.skipUnless(HAS_GO, "go not installed")
+    def test_go_hang_times_out(self):
+        import time
+
+        gym = self.make_gym()
+        work = stage(self, gym, "go-truncate")
+        (work / "hidden_hang_test.go").write_text(
+            'package truncate\n\nimport "testing"\n\n'
+            "func hiddenSpin() { for {} }\n\n"
+            "func TestHiddenHang(t *testing.T) { hiddenSpin() }\n"
+        )
+        start = time.monotonic()
+        r = bk.run_tests(gym, "go", work, "challenge", timeout=3)
+        self.assertEqual(r["status"], "timeout")
+        self.assertLess(time.monotonic() - start, 40)
+
+
 if __name__ == "__main__":
     unittest.main()

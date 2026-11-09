@@ -1,0 +1,16 @@
+{
+  "lang": "go",
+  "slug": "truncate",
+  "mode": "audit",
+  "tier": "medium",
+  "bugs": [
+    {
+      "id": "b1",
+      "category": "edge-cases",
+      "location": "challenge.go:Truncate",
+      "what": "cuts multi-byte strings in the middle of a character",
+      "why": "len and slicing count bytes, not runes",
+      "tests": ["TestHiddenTruncateMultibyte"]
+    }
+  ]
+}
